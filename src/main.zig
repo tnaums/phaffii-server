@@ -1,71 +1,86 @@
 const std = @import("std");
-const Io = std.Io;
+const builtin = @import("builtin");
+const c = @cImport({
+        @cInclude("time.h");
+});
 
-const phaffii_server = @import("phaffii_server");
+const MemStats = struct {
+    os: []const u8,
+    used_mb: u64,
+    total_mb: u64,
+    timestamp: i64,
+};
 
 pub fn main(init: std.process.Init) !void {
-    // Prints to stderr, unbuffered, ignoring potential errors.
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
-
-    // This is appropriate for anything that lives as long as the process.
-    const arena: std.mem.Allocator = init.arena.allocator();
-
-    // Accessing command line arguments:
-    const args = try init.minimal.args.toSlice(arena);
-    for (args) |arg| {
-        std.log.info("arg: {s}", .{arg});
-    }
-
-    // In order to do I/O operations need an `Io` instance.
     const io = init.io;
+    const allocator = init.gpa;
 
-    // Stdout is for the actual output of your application, for example if you
-    // are implementing gzip, then only the compressed bytes should be sent to
-    // stdout, not any debugging messages.
-    var stdout_buffer: [1024]u8 = undefined;
-    var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
-    const stdout_writer = &stdout_file_writer.interface;
+    const address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 8080);
+    var server = try address.listen(io, .{});
+    defer server.deinit(io);
 
-    try phaffii_server.printAnotherMessage(stdout_writer);
+    std.debug.print("Memory Service listening on 127.0.0.1:8080...\n", .{});
+    while (true) {
+        const stream = server.accept(io) catch |err| {
+            std.debug.print("Accept error: {}\n", .{err});
+            continue;
+        };
+        defer stream.close(io);
 
-    try stdout_writer.flush(); // Don't forget to flush!
+        const stats = try getMemoryStats(io);
+        std.debug.print("{any}\n", .{stats});
+        const json_str = try std.fmt.allocPrint(
+            allocator,
+            "{f}\n",
+            .{std.json.fmt(stats, .{})},
+        );
+        defer allocator.free(json_str);
+        std.debug.print("{s}\n", .{json_str});
+
+        var wbuf: [4096]u8 = undefined;
+        var writer_impl = stream.writer(io, &wbuf);
+        const writer = &writer_impl.interface;
+        try writer.writeAll(json_str);
+        try writer.flush();
+    }
 }
 
-test "simple test" {
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(i32) = .empty;
-    defer list.deinit(gpa); // Try commenting this out and see if zig detects the memory leak!
-    try list.append(gpa, 42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
-}
 
-test "fuzz example" {
-    try std.testing.fuzz({}, testOne, .{});
-}
+fn getMemoryStats(io: std.Io) !MemStats {
+    var ts: c.struct_timespec = undefined;
+    _ = c.clock_gettime(c.CLOCK_REALTIME, &ts);
 
-fn testOne(context: void, smith: *std.testing.Smith) !void {
-    _ = context;
-    // Try passing `--fuzz` to `zig build test` and see if it manages to fail this test case!
-
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(u8) = .empty;
-    defer list.deinit(gpa);
-    while (!smith.eos()) switch (smith.value(enum { add_data, dup_data })) {
-        .add_data => {
-            const slice = try list.addManyAsSlice(gpa, smith.value(u4));
-            smith.bytes(slice);
-        },
-        .dup_data => {
-            if (list.items.len == 0) continue;
-            if (list.items.len > std.math.maxInt(u32)) return error.SkipZigTest;
-            const len = smith.valueRangeAtMost(u32, 1, @min(32, list.items.len));
-            const off = smith.valueRangeAtMost(u32, 0, @intCast(list.items.len - len));
-            try list.appendSlice(gpa, list.items[off..][0..len]);
-            try std.testing.expectEqualSlices(
-                u8,
-                list.items[off..][0..len],
-                list.items[list.items.len - len ..],
-            );
-        },
+    var stats = MemStats{
+        .os = @tagName(builtin.os.tag),
+        .used_mb = 0,
+        .total_mb = 0,
+        .timestamp = @as(i64, ts.tv_sec),
     };
+    const file = try std.Io.Dir.cwd().openFile(
+        io,
+        "/proc/meminfo",
+        .{},
+    );
+    defer file.close(io);
+    var buf: [4096]u8 = undefined;
+    const n = try file.readPositionalAll(io, &buf, 0);
+    const content = buf[0..n];
+    var total_kb: u64 = 0;
+    var avail_kb: u64 = 0;
+    var lines = std.mem.tokenizeScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "MemTotal:")) total_kb = parseNumber(line);
+        if (std.mem.startsWith(u8, line, "MemAvailable:")) avail_kb = parseNumber(line);
+    }
+    stats.total_mb = total_kb / 1024;
+    stats.used_mb = (total_kb - avail_kb) / 1024;
+    return stats;
+}
+
+fn parseNumber(line: []const u8) u64 {
+    var parts = std.mem.tokenizeAny(u8, line, " .:");
+    while (parts.next()) |part| {
+        if (std.fmt.parseInt(u64, part, 10)) |val| return val else |_| continue;
+            }
+        return 0;
 }
